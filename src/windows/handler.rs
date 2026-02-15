@@ -682,6 +682,7 @@ type GetUpdateItemInfoFn =
     unsafe extern "system" fn(*mut c_void, u32, *mut i32, *mut i32, *mut u32) -> HRESULT;
 type GetPropertyFn = unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void) -> HRESULT;
 type GetStreamFnUpdate = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+type SetOperationResultUpdateFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESULT;
 
 unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
     this: *mut PluginHandler<T>,
@@ -697,14 +698,65 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
         }
 
         // Get callback vtable functions
+        // IArchiveUpdateCallback vtable layout:
+        // 0: QueryInterface, 1: AddRef, 2: Release (IUnknown)
+        // 3: SetTotal, 4: SetCompleted (IProgress)
+        // 5: GetUpdateItemInfo, 6: GetProperty, 7: GetStream, 8: SetOperationResult
         let cb_vtable = *(update_callback as *const *const *const c_void);
+        let set_total: SetTotalFn = std::mem::transmute(*cb_vtable.add(3));
+        let set_completed: SetCompletedFn = std::mem::transmute(*cb_vtable.add(4));
         let get_update_item_info: GetUpdateItemInfoFn = std::mem::transmute(*cb_vtable.add(5));
         let get_property: GetPropertyFn = std::mem::transmute(*cb_vtable.add(6));
         let get_stream: GetStreamFnUpdate = std::mem::transmute(*cb_vtable.add(7));
+        let set_operation_result: SetOperationResultUpdateFn =
+            std::mem::transmute(*cb_vtable.add(8));
 
         use crate::types::UpdateItem;
         let mut updates = Vec::new();
+        let mut total_size: u64 = 0;
 
+        // First pass: gather update info and calculate total size
+        for i in 0..num_items {
+            let mut new_data: i32 = 0;
+            let mut new_props: i32 = 0;
+            let mut index_in_archive: u32 = u32::MAX;
+
+            let hr = get_update_item_info(
+                update_callback,
+                i,
+                &mut new_data,
+                &mut new_props,
+                &mut index_in_archive,
+            );
+            if hr.is_err() {
+                return hr;
+            }
+
+            if new_data != 0 {
+                // New file - get size property for progress tracking
+                let mut size_prop = RawPropVariant::default();
+                let _ = get_property(
+                    update_callback,
+                    i,
+                    PropId::Size as u32,
+                    &mut size_prop as *mut _ as *mut c_void,
+                );
+                let file_size = size_prop.get_u64().unwrap_or(0);
+                total_size += file_size;
+            } else if index_in_archive != u32::MAX {
+                // Copying existing item - get its size
+                if let Some(item) = handler.inner.get_item(index_in_archive as usize) {
+                    total_size += item.size;
+                }
+            }
+        }
+
+        // Report total size to 7-Zip
+        let _ = set_total(update_callback, total_size);
+
+        let mut completed: u64 = 0;
+
+        // Second pass: collect data with progress updates
         for i in 0..num_items {
             let mut new_data: i32 = 0;
             let mut new_props: i32 = 0;
@@ -754,13 +806,30 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
                     Vec::new()
                 };
 
+                // Update progress
+                completed += data.len() as u64;
+                let _ = set_completed(update_callback, &completed);
+
                 updates.push(UpdateItem::AddNew { name, data });
+
+                // Report operation result for this item
+                let _ = set_operation_result(update_callback, NRESULT_OK);
             } else {
-                // Copy existing item
+                // Copy existing item - update progress if we have item info
+                if index_in_archive != u32::MAX
+                    && let Some(item) = handler.inner.get_item(index_in_archive as usize)
+                {
+                    completed += item.size;
+                    let _ = set_completed(update_callback, &completed);
+                }
+
                 updates.push(UpdateItem::CopyExisting {
                     index: index_in_archive as usize,
                     new_name: None,
                 });
+
+                // Report operation result for this item
+                let _ = set_operation_result(update_callback, NRESULT_OK);
             }
         }
 

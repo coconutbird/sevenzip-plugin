@@ -186,6 +186,28 @@ impl RawPropVariant {
             )))
         }
     }
+
+    /// Extract a u64 value from this PROPVARIANT.
+    ///
+    /// Returns `Some(value)` if the type is VT_UI8 or VT_UI4, `None` otherwise.
+    pub fn get_u64(&self) -> Option<u64> {
+        match self.vt {
+            VT_UI8 => Some(self.data),
+            VT_UI4 => Some(self.data & 0xFFFF_FFFF),
+            _ => None,
+        }
+    }
+
+    /// Extract a u32 value from this PROPVARIANT.
+    ///
+    /// Returns `Some(value)` if the type is VT_UI4, `None` otherwise.
+    pub fn get_u32(&self) -> Option<u32> {
+        if self.vt == VT_UI4 {
+            Some(self.data as u32)
+        } else {
+            None
+        }
+    }
 }
 
 /// Write a RawPropVariant to a raw pointer (used by 7-Zip callbacks).
