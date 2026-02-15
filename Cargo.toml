@@ -4,7 +4,7 @@ description = "Safe Rust framework for creating 7-Zip plugins"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/coconutbird/sevenzip-plugin-rs"
+repository = "https://github.com/coconutbird/sevenzip-plugin"
 keywords = ["7zip", "archive", "plugin", "com"]
 categories = ["compression", "os::windows-apis"]
 
