@@ -10,7 +10,6 @@ use windows::Win32::Foundation::{
 use windows::core::{BSTR, GUID, HRESULT};
 
 use crate::traits::{ArchiveReader, ArchiveUpdater};
-use crate::types::ArchiveItem;
 
 use super::com::{
     ArchivePropId, IID_IINARCHIVE, IID_IOUTARCHIVE, IID_IUNKNOWN, IInArchiveVtbl, IOutArchiveVtbl,
@@ -183,8 +182,6 @@ pub struct PluginHandler<T: ArchiveReader> {
     ref_count: AtomicU32,
     /// The actual archive implementation (safe Rust)
     pub(crate) inner: T,
-    /// Cached items from the archive
-    pub(crate) items: Vec<ArchiveItem>,
     /// Raw archive data (needed for editing)
     pub(crate) archive_data: Option<Vec<u8>>,
     /// Physical archive size
@@ -286,23 +283,16 @@ unsafe extern "system" fn open<T: ArchiveReader>(
         };
 
         handler.archive_size = data.len() as u64;
-        handler.archive_data = Some(data.clone());
 
-        // Call the safe open method
+        // Call the safe open method (before moving data)
         if let Err(_e) = handler.inner.open(&data) {
             #[cfg(debug_assertions)]
             eprintln!("[sevenzip-plugin] Failed to open archive: {}", _e);
             return S_FALSE;
         }
 
-        // Copy items from the inner implementation
-        handler.items.clear();
-        for i in 0..handler.inner.item_count() {
-            if let Some(item) = handler.inner.get_item(i) {
-                handler.items.push(item.clone());
-            }
-        }
-
+        // Store archive data by moving, not cloning
+        handler.archive_data = Some(data);
         handler.is_open = true;
         S_OK
     }
@@ -312,7 +302,6 @@ unsafe extern "system" fn close<T: ArchiveReader>(this: *mut PluginHandler<T>) -
     unsafe {
         let handler = &mut *this;
         handler.inner.close();
-        handler.items.clear();
         handler.archive_data = None;
         handler.is_open = false;
         handler.archive_size = 0;
@@ -329,7 +318,7 @@ unsafe extern "system" fn get_number_of_items<T: ArchiveReader>(
             return E_INVALIDARG;
         }
         let handler = &*this;
-        *num_items = handler.items.len() as u32;
+        *num_items = handler.inner.item_count() as u32;
         S_OK
     }
 }
@@ -346,7 +335,7 @@ unsafe extern "system" fn get_property<T: ArchiveReader>(
         }
 
         let handler = &*this;
-        let Some(item) = handler.items.get(index as usize) else {
+        let Some(item) = handler.inner.get_item(index as usize) else {
             return E_INVALIDARG;
         };
 
@@ -417,7 +406,7 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
         // Determine which indices to extract
         let extract_all = num_items == u32::MAX;
         let indices_to_extract: Vec<usize> = if extract_all {
-            (0..handler.items.len()).collect()
+            (0..handler.inner.item_count()).collect()
         } else {
             std::slice::from_raw_parts(indices, num_items as usize)
                 .iter()
@@ -428,7 +417,7 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
         // Calculate total size
         let total_size: u64 = indices_to_extract
             .iter()
-            .filter_map(|&i| handler.items.get(i))
+            .filter_map(|&i| handler.inner.get_item(i))
             .map(|item| item.size)
             .sum();
 
@@ -437,8 +426,10 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
         let mut completed: u64 = 0;
 
         for &index in &indices_to_extract {
-            let Some(item) = handler.items.get(index) else {
-                continue;
+            // Get item size before mutable borrow for extract()
+            let item_size = match handler.inner.get_item(index) {
+                Some(item) => item.size,
+                None => continue,
             };
 
             // Get output stream
@@ -502,7 +493,7 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
             }
 
             // Update progress
-            completed += item.size;
+            completed += item_size;
             let _ = set_completed(extract_callback, &completed);
         }
 
@@ -882,7 +873,6 @@ impl<T: ArchiveReader> RegisteredFormat<T> {
             out_vtbl: self.out_vtbl,
             ref_count: AtomicU32::new(1),
             inner: T::default(),
-            items: Vec::new(),
             archive_data: None,
             archive_size: 0,
             is_open: false,
