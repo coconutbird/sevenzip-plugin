@@ -2,6 +2,7 @@
 
 use crate::error::Result;
 use crate::types::{ArchiveItem, UpdateItem};
+use std::io::Write;
 
 /// Metadata about an archive format.
 ///
@@ -56,6 +57,24 @@ pub trait ArchiveReader: ArchiveFormat {
     /// Returns the uncompressed file contents.
     fn extract(&mut self, index: usize) -> Result<Vec<u8>>;
 
+    /// Extract an item's data directly to a writer (streaming).
+    ///
+    /// This avoids allocating a `Vec<u8>` for the entire file contents,
+    /// which is more memory efficient for large files.
+    ///
+    /// The default implementation calls `extract()` and writes the result.
+    /// Override this for better memory efficiency with large files.
+    ///
+    /// Returns the number of bytes written.
+    fn extract_to(&mut self, index: usize, writer: &mut dyn Write) -> Result<u64> {
+        let data = self.extract(index)?;
+        let len = data.len() as u64;
+        writer
+            .write_all(&data)
+            .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+        Ok(len)
+    }
+
     /// Close the archive and release resources.
     ///
     /// Called when 7-Zip is done with the archive.
@@ -81,4 +100,27 @@ pub trait ArchiveUpdater: ArchiveReader {
     ///
     /// Returns the complete new archive data as bytes.
     fn update(&mut self, existing_data: &[u8], updates: Vec<UpdateItem>) -> Result<Vec<u8>>;
+
+    /// Update an existing archive, writing directly to a writer (streaming).
+    ///
+    /// This avoids allocating a `Vec<u8>` for the entire output archive,
+    /// which is more memory efficient for large archives.
+    ///
+    /// The default implementation calls `update()` and writes the result.
+    /// Override this for better memory efficiency with large archives.
+    ///
+    /// Returns the number of bytes written.
+    fn update_to(
+        &mut self,
+        existing_data: &[u8],
+        updates: Vec<UpdateItem>,
+        writer: &mut dyn Write,
+    ) -> Result<u64> {
+        let data = self.update(existing_data, updates)?;
+        let len = data.len() as u64;
+        writer
+            .write_all(&data)
+            .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+        Ok(len)
+    }
 }

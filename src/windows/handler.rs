@@ -127,44 +127,6 @@ pub(crate) unsafe fn read_sequential_stream(stream: *mut c_void) -> std::io::Res
     }
 }
 
-/// Write data to ISequentialOutStream
-pub(crate) unsafe fn write_to_stream(stream: *mut c_void, data: &[u8]) -> std::io::Result<()> {
-    unsafe {
-        if stream.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Null stream pointer",
-            ));
-        }
-
-        type WriteFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32) -> HRESULT;
-
-        let vtable = *(stream as *const *const *const c_void);
-        let write_fn: WriteFn = std::mem::transmute(*vtable.add(3));
-
-        let mut total_written = 0;
-        while total_written < data.len() {
-            let mut written: u32 = 0;
-            let chunk_size = (data.len() - total_written).min(1024 * 1024) as u32;
-            let hr = write_fn(
-                stream,
-                data[total_written..].as_ptr(),
-                chunk_size,
-                &mut written,
-            );
-            if hr.is_err() {
-                return Err(std::io::Error::other(format!("Write failed: {:?}", hr)));
-            }
-            if written == 0 {
-                break;
-            }
-            total_written += written as usize;
-        }
-
-        Ok(())
-    }
-}
-
 // =============================================================================
 // Generic Plugin Handler
 // =============================================================================
@@ -381,6 +343,50 @@ type SetOperationResultFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESU
 type WriteFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32) -> HRESULT;
 type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
 
+/// Wrapper for ISequentialOutStream that implements `std::io::Write`.
+///
+/// This allows streaming writes directly to 7-Zip's output stream,
+/// avoiding intermediate allocations.
+struct SeqOutStreamWriter {
+    stream: *mut c_void,
+    write_fn: WriteFn,
+}
+
+impl std::io::Write for SeqOutStreamWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let chunk_size = buf.len().min(u32::MAX as usize) as u32;
+        let mut written: u32 = 0;
+
+        // Safety: we're calling the COM method with valid pointers
+        let hr = unsafe { (self.write_fn)(self.stream, buf.as_ptr(), chunk_size, &mut written) };
+
+        if hr.is_err() {
+            return Err(std::io::Error::other(format!(
+                "Write failed with HRESULT: {:?}",
+                hr
+            )));
+        }
+
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Write returned zero bytes",
+            ));
+        }
+
+        Ok(written as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // ISequentialOutStream has no flush method
+        Ok(())
+    }
+}
+
 unsafe extern "system" fn extract<T: ArchiveReader>(
     this: *mut PluginHandler<T>,
     indices: *const u32,
@@ -451,30 +457,17 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
             let result = if test_mode != 0 || out_stream.is_null() {
                 NRESULT_OK
             } else {
-                // Extract data using safe trait method
-                match handler.inner.extract(index) {
-                    Ok(data) => {
-                        // Write to output stream
-                        let stream_vtable = *(out_stream as *const *const *const c_void);
-                        let write: WriteFn = std::mem::transmute(*stream_vtable.add(3));
+                // Extract data using streaming trait method
+                let stream_vtable = *(out_stream as *const *const *const c_void);
+                let write_fn: WriteFn = std::mem::transmute(*stream_vtable.add(3));
 
-                        let mut total_written = 0;
-                        while total_written < data.len() {
-                            let mut written: u32 = 0;
-                            let chunk = (data.len() - total_written).min(1024 * 1024) as u32;
-                            let hr = write(
-                                out_stream,
-                                data[total_written..].as_ptr(),
-                                chunk,
-                                &mut written,
-                            );
-                            if hr.is_err() || written == 0 {
-                                break;
-                            }
-                            total_written += written as usize;
-                        }
-                        NRESULT_OK
-                    }
+                let mut writer = SeqOutStreamWriter {
+                    stream: out_stream,
+                    write_fn,
+                };
+
+                match handler.inner.extract_to(index, &mut writer) {
+                    Ok(_) => NRESULT_OK,
                     Err(_) => NRESULT_DATA_ERROR,
                 }
             };
@@ -836,15 +829,18 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
         // Get existing archive data
         let existing_data = handler.archive_data.as_deref().unwrap_or(&[]);
 
-        // Call the safe update method
-        match handler.inner.update(existing_data, updates) {
-            Ok(output_data) => {
-                // Write to output stream
-                if write_to_stream(out_stream, &output_data).is_err() {
-                    return S_FALSE;
-                }
-                S_OK
-            }
+        // Create streaming writer for output
+        let stream_vtable = *(out_stream as *const *const *const c_void);
+        let write_fn: WriteFn = std::mem::transmute(*stream_vtable.add(3));
+
+        let mut writer = SeqOutStreamWriter {
+            stream: out_stream,
+            write_fn,
+        };
+
+        // Call the streaming update method
+        match handler.inner.update_to(existing_data, updates, &mut writer) {
+            Ok(_) => S_OK,
             Err(_) => S_FALSE,
         }
     }
