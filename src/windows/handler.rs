@@ -1,8 +1,10 @@
 //! Generic COM handler wrapper that bridges safe traits to 7-Zip interfaces.
 
 use std::ffi::c_void;
+use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use windows::Win32::Foundation::{
     E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, S_FALSE, S_OK,
@@ -19,74 +21,8 @@ use super::propvariant::RawPropVariant;
 
 // Stream seek origins
 const STREAM_SEEK_SET: u32 = 0;
+const STREAM_SEEK_CUR: u32 = 1;
 const STREAM_SEEK_END: u32 = 2;
-
-/// Read all data from a 7-Zip IInStream into a Vec<u8>.
-pub(crate) unsafe fn read_stream_to_vec(stream: *mut c_void) -> std::io::Result<Vec<u8>> {
-    unsafe {
-        if stream.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Null stream pointer",
-            ));
-        }
-
-        // IInStream vtable layout:
-        // 0: QueryInterface, 1: AddRef, 2: Release (IUnknown)
-        // 3: Read (ISequentialInStream)
-        // 4: Seek (IInStream)
-        type SeekFn = unsafe extern "system" fn(*mut c_void, i64, u32, *mut u64) -> HRESULT;
-        type ReadFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32) -> HRESULT;
-
-        let vtable = *(stream as *const *const *const c_void);
-        let seek_fn: SeekFn = std::mem::transmute(*vtable.add(4));
-        let read_fn: ReadFn = std::mem::transmute(*vtable.add(3));
-
-        // Seek to end to get size
-        let mut size: u64 = 0;
-        let hr = seek_fn(stream, 0, STREAM_SEEK_END, &mut size);
-        if hr.is_err() {
-            return Err(std::io::Error::other(format!(
-                "Failed to seek to end: {:?}",
-                hr
-            )));
-        }
-
-        // Seek back to start
-        let mut pos: u64 = 0;
-        let hr = seek_fn(stream, 0, STREAM_SEEK_SET, &mut pos);
-        if hr.is_err() {
-            return Err(std::io::Error::other(format!(
-                "Failed to seek to start: {:?}",
-                hr
-            )));
-        }
-
-        // Read all data
-        let mut data = vec![0u8; size as usize];
-        let mut total_read: usize = 0;
-
-        while total_read < size as usize {
-            let mut bytes_read: u32 = 0;
-            let hr = read_fn(
-                stream,
-                data[total_read..].as_mut_ptr(),
-                (size as usize - total_read).min(1024 * 1024) as u32,
-                &mut bytes_read,
-            );
-            if hr.is_err() {
-                return Err(std::io::Error::other(format!("Failed to read: {:?}", hr)));
-            }
-            if bytes_read == 0 {
-                break;
-            }
-            total_read += bytes_read as usize;
-        }
-
-        data.truncate(total_read);
-        Ok(data)
-    }
-}
 
 /// Read data from ISequentialInStream
 pub(crate) unsafe fn read_sequential_stream(stream: *mut c_void) -> std::io::Result<Vec<u8>> {
@@ -128,6 +64,123 @@ pub(crate) unsafe fn read_sequential_stream(stream: *mut c_void) -> std::io::Res
 }
 
 // =============================================================================
+// Streaming Input Reader
+// =============================================================================
+
+// Function pointer types for IInStream
+type InStreamReadFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32) -> HRESULT;
+type InStreamSeekFn = unsafe extern "system" fn(*mut c_void, i64, u32, *mut u64) -> HRESULT;
+
+/// Wrapper for IInStream that implements `std::io::Read + Seek`.
+///
+/// This allows zero-copy streaming reads from 7-Zip's input stream,
+/// avoiding the need to buffer the entire archive in memory.
+pub struct InStreamReader {
+    stream: *mut c_void,
+    read_fn: InStreamReadFn,
+    seek_fn: InStreamSeekFn,
+    size: u64,
+}
+
+impl InStreamReader {
+    /// Create a new InStreamReader from a raw IInStream pointer.
+    ///
+    /// # Safety
+    /// The stream pointer must be valid and point to a valid IInStream COM object.
+    pub unsafe fn new(stream: *mut c_void) -> std::io::Result<Self> {
+        unsafe {
+            if stream.is_null() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Null stream pointer",
+                ));
+            }
+
+            let vtable = *(stream as *const *const *const c_void);
+            let read_fn: InStreamReadFn = std::mem::transmute(*vtable.add(3));
+            let seek_fn: InStreamSeekFn = std::mem::transmute(*vtable.add(4));
+
+            // Get stream size by seeking to end
+            let mut size: u64 = 0;
+            let hr = seek_fn(stream, 0, STREAM_SEEK_END, &mut size);
+            if hr.is_err() {
+                return Err(std::io::Error::other(format!(
+                    "Failed to get stream size: {:?}",
+                    hr
+                )));
+            }
+
+            // Seek back to start
+            let mut pos: u64 = 0;
+            let hr = seek_fn(stream, 0, STREAM_SEEK_SET, &mut pos);
+            if hr.is_err() {
+                return Err(std::io::Error::other(format!(
+                    "Failed to seek to start: {:?}",
+                    hr
+                )));
+            }
+
+            Ok(Self {
+                stream,
+                read_fn,
+                seek_fn,
+                size,
+            })
+        }
+    }
+
+    /// Get the total size of the stream in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl Read for InStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let chunk_size = buf.len().min(u32::MAX as usize) as u32;
+        let mut bytes_read: u32 = 0;
+
+        let hr =
+            unsafe { (self.read_fn)(self.stream, buf.as_mut_ptr(), chunk_size, &mut bytes_read) };
+
+        if hr.is_err() {
+            return Err(std::io::Error::other(format!(
+                "Read failed with HRESULT: {:?}",
+                hr
+            )));
+        }
+
+        Ok(bytes_read as usize)
+    }
+}
+
+impl Seek for InStreamReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let (offset, origin) = match pos {
+            SeekFrom::Start(n) => (n as i64, STREAM_SEEK_SET),
+            SeekFrom::Current(n) => (n, STREAM_SEEK_CUR),
+            SeekFrom::End(n) => (n, STREAM_SEEK_END),
+        };
+
+        let mut new_pos: u64 = 0;
+        let hr = unsafe { (self.seek_fn)(self.stream, offset, origin, &mut new_pos) };
+
+        if hr.is_err() {
+            return Err(std::io::Error::other(format!(
+                "Seek failed with HRESULT: {:?}",
+                hr
+            )));
+        }
+
+        Ok(new_pos)
+    }
+}
+
+// =============================================================================
 // Generic Plugin Handler
 // =============================================================================
 
@@ -144,8 +197,8 @@ pub struct PluginHandler<T: ArchiveReader> {
     ref_count: AtomicU32,
     /// The actual archive implementation (safe Rust)
     pub(crate) inner: T,
-    /// Raw archive data (needed for editing)
-    pub(crate) archive_data: Option<Vec<u8>>,
+    /// Input stream pointer (AddRef'd, must Release on close)
+    pub(crate) in_stream: *mut c_void,
     /// Physical archive size
     pub(crate) archive_size: u64,
     /// Is archive open
@@ -225,6 +278,10 @@ unsafe extern "system" fn release<T: ArchiveReader>(this: *mut PluginHandler<T>)
 // IInArchive implementation
 // =============================================================================
 
+// COM AddRef function type
+type AddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+
 unsafe extern "system" fn open<T: ArchiveReader>(
     this: *mut PluginHandler<T>,
     stream: *mut c_void,
@@ -234,27 +291,36 @@ unsafe extern "system" fn open<T: ArchiveReader>(
     unsafe {
         let handler = &mut *this;
 
-        // Read stream data
-        let data = match read_stream_to_vec(stream) {
-            Ok(d) => d,
+        if stream.is_null() {
+            return E_POINTER;
+        }
+
+        // Create streaming reader wrapper
+        let mut reader = match InStreamReader::new(stream) {
+            Ok(r) => r,
             Err(_e) => {
                 #[cfg(debug_assertions)]
-                eprintln!("[sevenzip-plugin] Failed to read stream: {}", _e);
+                eprintln!("[sevenzip-plugin] Failed to create stream reader: {}", _e);
                 return S_FALSE;
             }
         };
 
-        handler.archive_size = data.len() as u64;
+        let size = reader.size();
 
-        // Call the safe open method (before moving data)
-        if let Err(_e) = handler.inner.open(&data) {
+        // Call the safe streaming open method
+        if let Err(_e) = handler.inner.open(&mut reader, size) {
             #[cfg(debug_assertions)]
             eprintln!("[sevenzip-plugin] Failed to open archive: {}", _e);
             return S_FALSE;
         }
 
-        // Store archive data by moving, not cloning
-        handler.archive_data = Some(data);
+        // AddRef the stream to keep it alive
+        let vtable = *(stream as *const *const *const c_void);
+        let add_ref: AddRefFn = std::mem::transmute(*vtable.add(1));
+        add_ref(stream);
+
+        handler.in_stream = stream;
+        handler.archive_size = size;
         handler.is_open = true;
         S_OK
     }
@@ -264,7 +330,15 @@ unsafe extern "system" fn close<T: ArchiveReader>(this: *mut PluginHandler<T>) -
     unsafe {
         let handler = &mut *this;
         handler.inner.close();
-        handler.archive_data = None;
+
+        // Release the input stream if we have one
+        if !handler.in_stream.is_null() {
+            let vtable = *(handler.in_stream as *const *const *const c_void);
+            let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
+            release(handler.in_stream);
+            handler.in_stream = std::ptr::null_mut();
+        }
+
         handler.is_open = false;
         handler.archive_size = 0;
         S_OK
@@ -341,7 +415,6 @@ type GetStreamFn = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void,
 type PrepareOperationFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESULT;
 type SetOperationResultFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESULT;
 type WriteFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32) -> HRESULT;
-type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// Wrapper for ISequentialOutStream that implements `std::io::Write`.
 ///
@@ -684,6 +757,9 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
     update_callback: *mut c_void,
 ) -> HRESULT {
     unsafe {
+        let total_start = Instant::now();
+        eprintln!("[7zip-plugin] update_items called with {} items", num_items);
+
         let handler = &mut *out_vtbl_to_handler(this);
 
         if out_stream.is_null() || update_callback.is_null() {
@@ -826,8 +902,7 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
             }
         }
 
-        // Get existing archive data
-        let existing_data = handler.archive_data.as_deref().unwrap_or(&[]);
+        eprintln!("[7zip-plugin] Collection phase done in {:?}", total_start.elapsed());
 
         // Create streaming writer for output
         let stream_vtable = *(out_stream as *const *const *const c_void);
@@ -838,11 +913,56 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
             write_fn,
         };
 
-        // Call the streaming update method
-        match handler.inner.update_to(existing_data, updates, &mut writer) {
-            Ok(_) => S_OK,
-            Err(_) => S_FALSE,
+        eprintln!("[7zip-plugin] Calling update_streaming...");
+        let update_start = Instant::now();
+
+        // Create reader for existing archive (if we have one)
+        let result = if handler.in_stream.is_null() {
+            // No existing archive - create empty reader
+            let mut empty_reader = std::io::Cursor::new(&[] as &[u8]);
+            match handler
+                .inner
+                .update_streaming(&mut empty_reader, 0, updates, &mut writer)
+            {
+                Ok(_) => S_OK,
+                Err(_) => S_FALSE,
+            }
+        } else {
+            // Use existing archive stream
+            let mut reader = match InStreamReader::new(handler.in_stream) {
+                Ok(r) => r,
+                Err(_) => return S_FALSE,
+            };
+            let size = reader.size();
+
+            match handler
+                .inner
+                .update_streaming(&mut reader, size, updates, &mut writer)
+            {
+                Ok(_) => S_OK,
+                Err(_) => S_FALSE,
+            }
+        };
+
+        eprintln!("[7zip-plugin] update_streaming done in {:?}", update_start.elapsed());
+
+        // Release the input stream to allow 7-Zip to replace the original file
+        // This must happen after update completes but before we return
+        eprintln!("[7zip-plugin] Releasing in_stream...");
+        let release_start = Instant::now();
+
+        if !handler.in_stream.is_null() {
+            let vtable = *(handler.in_stream as *const *const *const c_void);
+            let release_fn: ReleaseFn = std::mem::transmute(*vtable.add(2));
+            release_fn(handler.in_stream);
+            handler.in_stream = std::ptr::null_mut();
+            handler.is_open = false;
         }
+
+        eprintln!("[7zip-plugin] in_stream released in {:?}", release_start.elapsed());
+        eprintln!("[7zip-plugin] Total update_items: {:?}", total_start.elapsed());
+
+        result
     }
 }
 
@@ -938,7 +1058,7 @@ impl<T: ArchiveReader> RegisteredFormat<T> {
             out_vtbl: self.out_vtbl,
             ref_count: AtomicU32::new(1),
             inner: T::default(),
-            archive_data: None,
+            in_stream: std::ptr::null_mut(),
             archive_size: 0,
             is_open: false,
         });

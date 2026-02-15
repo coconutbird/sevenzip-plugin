@@ -2,7 +2,16 @@
 
 use crate::error::Result;
 use crate::types::{ArchiveItem, UpdateItem};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
+
+/// A trait alias for types that implement both `Read` and `Seek`.
+///
+/// This is used for streaming archive input, allowing plugins to read
+/// archive data on-demand without buffering the entire file in memory.
+pub trait ReadSeek: Read + Seek {}
+
+// Blanket implementation for all types that implement Read + Seek
+impl<T: Read + Seek> ReadSeek for T {}
 
 /// Metadata about an archive format.
 ///
@@ -40,11 +49,17 @@ pub trait ArchiveFormat: Default + Send + 'static {
 ///
 /// Implement this to allow 7-Zip to open and extract from your archive format.
 pub trait ArchiveReader: ArchiveFormat {
-    /// Open and parse the archive from raw bytes.
+    /// Open and parse the archive from a streaming reader.
     ///
     /// This is called when 7-Zip opens an archive file.
-    /// Store the parsed data internally for later extraction.
-    fn open(&mut self, data: &[u8]) -> Result<()>;
+    /// The reader supports both sequential reads and seeking, allowing
+    /// you to read only the parts of the archive you need.
+    ///
+    /// - `reader`: A seekable reader for the archive data
+    /// - `size`: Total size of the archive in bytes
+    ///
+    /// Store any parsed metadata internally for later extraction.
+    fn open(&mut self, reader: &mut dyn ReadSeek, size: u64) -> Result<()>;
 
     /// Returns the number of items in the archive.
     fn item_count(&self) -> usize;
@@ -93,34 +108,22 @@ pub trait ArchiveReader: ArchiveFormat {
 /// Implement this to allow 7-Zip to create new archives or modify existing ones.
 /// Creating a new archive is simply updating from empty data with all `AddNew` items.
 pub trait ArchiveUpdater: ArchiveReader {
-    /// Update an existing archive.
+    /// Update an existing archive with full streaming I/O.
     ///
-    /// - `existing_data`: The raw bytes of the existing archive
+    /// - `existing`: A seekable reader for the existing archive (or empty if creating new)
+    /// - `existing_size`: Size of the existing archive in bytes (0 if creating new)
     /// - `updates`: List of update operations (copy existing or add new)
+    /// - `writer`: Output stream to write the new archive to
     ///
-    /// Returns the complete new archive data as bytes.
-    fn update(&mut self, existing_data: &[u8], updates: Vec<UpdateItem>) -> Result<Vec<u8>>;
-
-    /// Update an existing archive, writing directly to a writer (streaming).
+    /// Returns the number of bytes written to the output.
     ///
-    /// This avoids allocating a `Vec<u8>` for the entire output archive,
-    /// which is more memory efficient for large archives.
-    ///
-    /// The default implementation calls `update()` and writes the result.
-    /// Override this for better memory efficiency with large archives.
-    ///
-    /// Returns the number of bytes written.
-    fn update_to(
+    /// This method enables true zero-copy updates by reading from the existing
+    /// archive and writing to the output without buffering everything in memory.
+    fn update_streaming(
         &mut self,
-        existing_data: &[u8],
+        existing: &mut dyn ReadSeek,
+        existing_size: u64,
         updates: Vec<UpdateItem>,
         writer: &mut dyn Write,
-    ) -> Result<u64> {
-        let data = self.update(existing_data, updates)?;
-        let len = data.len() as u64;
-        writer
-            .write_all(&data)
-            .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-        Ok(len)
-    }
+    ) -> Result<u64>;
 }
