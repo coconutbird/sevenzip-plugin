@@ -4,7 +4,6 @@ use std::ffi::c_void;
 use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
 
 use windows::Win32::Foundation::{
     E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, S_FALSE, S_OK,
@@ -14,10 +13,11 @@ use windows::core::{BSTR, GUID, HRESULT};
 use crate::traits::{ArchiveReader, ArchiveUpdater};
 
 use super::com::{
-    ArchivePropId, IID_IINARCHIVE, IID_IOUTARCHIVE, IID_IUNKNOWN, IInArchiveVtbl, IOutArchiveVtbl,
-    PropId,
+    ArchivePropId, IID_ICRYPTO_GET_TEXT_PASSWORD, IID_ICRYPTO_GET_TEXT_PASSWORD2, IID_IINARCHIVE,
+    IID_IOUTARCHIVE, IID_IUNKNOWN, IInArchiveVtbl, IOutArchiveVtbl, PropId,
 };
 use super::propvariant::RawPropVariant;
+use crate::types::{PasswordProvider, PasswordRequester};
 
 // Stream seek origins
 const STREAM_SEEK_SET: u32 = 0;
@@ -268,6 +268,15 @@ unsafe extern "system" fn release<T: ArchiveReader>(this: *mut PluginHandler<T>)
         // Access the atomic directly through the raw pointer.
         let count = (*this).ref_count.fetch_sub(1, Ordering::SeqCst) - 1;
         if count == 0 {
+            // Release the input stream before destroying the handler
+            let handler = &mut *this;
+            if !handler.in_stream.is_null() {
+                let vtable = *(handler.in_stream as *const *const *const c_void);
+                let release_fn: ReleaseFn = std::mem::transmute(*vtable.add(2));
+                release_fn(handler.in_stream);
+                handler.in_stream = std::ptr::null_mut();
+            }
+            handler.inner.close();
             drop(Box::from_raw(this));
         }
         count
@@ -281,18 +290,194 @@ unsafe extern "system" fn release<T: ArchiveReader>(this: *mut PluginHandler<T>)
 // COM AddRef function type
 type AddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
 type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type QueryInterfaceFn =
+    unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+type CryptoGetTextPasswordFn = unsafe extern "system" fn(*mut c_void, *mut BSTR) -> HRESULT;
+
+/// Wrapper around 7-Zip's ICryptoGetTextPassword interface.
+///
+/// This allows plugin authors to request passwords from the user for encrypted archives.
+struct PasswordRequesterWrapper {
+    crypto_callback: *mut c_void,
+}
+
+impl PasswordRequesterWrapper {
+    /// Try to create a password requester from an open callback.
+    ///
+    /// Returns `None` if the callback doesn't support password requests.
+    unsafe fn try_from_callback(open_callback: *mut c_void) -> Option<Self> {
+        if open_callback.is_null() {
+            return None;
+        }
+
+        unsafe {
+            // QueryInterface for ICryptoGetTextPassword
+            let vtable = *(open_callback as *const *const *const c_void);
+            let query_interface: QueryInterfaceFn = std::mem::transmute(*vtable);
+
+            let mut crypto_ptr: *mut c_void = std::ptr::null_mut();
+            let hr = query_interface(
+                open_callback,
+                &IID_ICRYPTO_GET_TEXT_PASSWORD,
+                &mut crypto_ptr,
+            );
+
+            if hr.is_ok() && !crypto_ptr.is_null() {
+                Some(Self {
+                    crypto_callback: crypto_ptr,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl PasswordRequester for PasswordRequesterWrapper {
+    fn get_password(&self) -> crate::error::Result<Option<String>> {
+        unsafe {
+            let vtable = *(self.crypto_callback as *const *const *const c_void);
+            // ICryptoGetTextPassword vtable: QueryInterface, AddRef, Release, CryptoGetTextPassword
+            let get_password: CryptoGetTextPasswordFn = std::mem::transmute(*vtable.add(3));
+
+            let mut bstr = BSTR::default();
+            let hr = get_password(self.crypto_callback, &mut bstr);
+
+            if hr.is_err() {
+                return Ok(None); // User cancelled or error
+            }
+
+            if bstr.is_empty() {
+                return Ok(Some(String::new()));
+            }
+
+            // Convert BSTR to String - BSTR will be freed when dropped
+            let password = bstr.to_string();
+
+            Ok(Some(password))
+        }
+    }
+}
+
+impl Drop for PasswordRequesterWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.crypto_callback.is_null() {
+                let vtable = *(self.crypto_callback as *const *const *const c_void);
+                let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
+                release(self.crypto_callback);
+            }
+        }
+    }
+}
+
+/// Function type for ICryptoGetTextPassword2::CryptoGetTextPassword2
+type CryptoGetTextPassword2Fn =
+    unsafe extern "system" fn(*mut c_void, *mut i32, *mut BSTR) -> HRESULT;
+
+/// Wrapper around 7-Zip's ICryptoGetTextPassword2 interface.
+///
+/// This allows plugin authors to get the password for creating encrypted archives.
+struct PasswordProviderWrapper {
+    crypto_callback: *mut c_void,
+}
+
+impl PasswordProviderWrapper {
+    /// Try to create a password provider from an update callback.
+    ///
+    /// Returns `None` if the callback doesn't support password setting.
+    unsafe fn try_from_callback(update_callback: *mut c_void) -> Option<Self> {
+        if update_callback.is_null() {
+            return None;
+        }
+
+        unsafe {
+            // QueryInterface for ICryptoGetTextPassword2
+            let vtable = *(update_callback as *const *const *const c_void);
+            let query_interface: QueryInterfaceFn = std::mem::transmute(*vtable);
+
+            let mut crypto_ptr: *mut c_void = std::ptr::null_mut();
+            let hr = query_interface(
+                update_callback,
+                &IID_ICRYPTO_GET_TEXT_PASSWORD2,
+                &mut crypto_ptr,
+            );
+
+            if hr.is_ok() && !crypto_ptr.is_null() {
+                Some(Self {
+                    crypto_callback: crypto_ptr,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl PasswordProvider for PasswordProviderWrapper {
+    fn get_password(&self) -> crate::error::Result<Option<String>> {
+        unsafe {
+            let vtable = *(self.crypto_callback as *const *const *const c_void);
+            // ICryptoGetTextPassword2 vtable: QueryInterface, AddRef, Release, CryptoGetTextPassword2
+            let get_password2: CryptoGetTextPassword2Fn = std::mem::transmute(*vtable.add(3));
+
+            let mut password_is_defined: i32 = 0;
+            let mut bstr = BSTR::default();
+            let hr = get_password2(self.crypto_callback, &mut password_is_defined, &mut bstr);
+
+            if hr.is_err() {
+                return Ok(None); // Error getting password
+            }
+
+            // If password is not defined, user doesn't want encryption
+            if password_is_defined == 0 {
+                return Ok(None);
+            }
+
+            if bstr.is_empty() {
+                return Ok(Some(String::new()));
+            }
+
+            // Convert BSTR to String - BSTR will be freed when dropped
+            let password = bstr.to_string();
+
+            Ok(Some(password))
+        }
+    }
+}
+
+impl Drop for PasswordProviderWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.crypto_callback.is_null() {
+                let vtable = *(self.crypto_callback as *const *const *const c_void);
+                let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
+                release(self.crypto_callback);
+            }
+        }
+    }
+}
 
 unsafe extern "system" fn open<T: ArchiveReader>(
     this: *mut PluginHandler<T>,
     stream: *mut c_void,
     _max_check_start_position: *const u64,
-    _open_callback: *mut c_void,
+    open_callback: *mut c_void,
 ) -> HRESULT {
     unsafe {
         let handler = &mut *this;
 
         if stream.is_null() {
             return E_POINTER;
+        }
+
+        // Release any existing stream before opening a new one
+        // This can happen if 7-Zip reopens the archive after an update
+        if !handler.in_stream.is_null() {
+            let old_vtable = *(handler.in_stream as *const *const *const c_void);
+            let release: ReleaseFn = std::mem::transmute(*old_vtable.add(2));
+            release(handler.in_stream);
+            handler.in_stream = std::ptr::null_mut();
         }
 
         // Create streaming reader wrapper
@@ -307,14 +492,29 @@ unsafe extern "system" fn open<T: ArchiveReader>(
 
         let size = reader.size();
 
-        // Call the safe streaming open method
-        if let Err(_e) = handler.inner.open(&mut reader, size) {
+        // Try to get password requester from open callback
+        let password_requester = PasswordRequesterWrapper::try_from_callback(open_callback);
+
+        // Call the safe streaming open method with password support
+        let open_result = if password_requester.is_some() {
+            handler.inner.open_with_password(
+                &mut reader,
+                size,
+                password_requester
+                    .as_ref()
+                    .map(|p| p as &dyn PasswordRequester),
+            )
+        } else {
+            handler.inner.open_with_password(&mut reader, size, None)
+        };
+
+        if let Err(_e) = open_result {
             #[cfg(debug_assertions)]
             eprintln!("[sevenzip-plugin] Failed to open archive: {}", _e);
             return S_FALSE;
         }
 
-        // AddRef the stream to keep it alive
+        // AddRef the stream to keep it alive while we have it
         let vtable = *(stream as *const *const *const c_void);
         let add_ref: AddRefFn = std::mem::transmute(*vtable.add(1));
         add_ref(stream);
@@ -393,6 +593,44 @@ unsafe extern "system" fn get_property<T: ArchiveReader>(
             }
             x if x == PropId::IsDir as u32 => {
                 prop.set_bool(item.is_dir);
+            }
+            x if x == PropId::MTime as u32 => {
+                if let Some(mtime) = item.modified {
+                    prop.set_filetime(super::propvariant::systemtime_to_filetime(mtime));
+                } else {
+                    prop.set_empty();
+                }
+            }
+            x if x == PropId::CTime as u32 => {
+                if let Some(ctime) = item.created {
+                    prop.set_filetime(super::propvariant::systemtime_to_filetime(ctime));
+                } else {
+                    prop.set_empty();
+                }
+            }
+            x if x == PropId::ATime as u32 => {
+                if let Some(atime) = item.accessed {
+                    prop.set_filetime(super::propvariant::systemtime_to_filetime(atime));
+                } else {
+                    prop.set_empty();
+                }
+            }
+            x if x == PropId::Attrib as u32 => {
+                if let Some(attrs) = item.attributes {
+                    prop.set_u32(attrs);
+                } else {
+                    prop.set_empty();
+                }
+            }
+            x if x == PropId::Crc as u32 => {
+                if let Some(crc) = item.crc {
+                    prop.set_u32(crc);
+                } else {
+                    prop.set_empty();
+                }
+            }
+            x if x == PropId::Encrypted as u32 => {
+                prop.set_bool(item.encrypted);
             }
             _ => {
                 prop.set_empty();
@@ -482,6 +720,10 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
         let prepare_operation: PrepareOperationFn = std::mem::transmute(*cb_vtable.add(6));
         let set_operation_result: SetOperationResultFn = std::mem::transmute(*cb_vtable.add(7));
 
+        // Try to get password requester from extract callback
+        // (for formats like ZIP where individual files can be encrypted)
+        let password_requester = PasswordRequesterWrapper::try_from_callback(extract_callback);
+
         // Determine which indices to extract
         let extract_all = num_items == u32::MAX;
         let indices_to_extract: Vec<usize> = if extract_all {
@@ -530,7 +772,7 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
             let result = if test_mode != 0 || out_stream.is_null() {
                 NRESULT_OK
             } else {
-                // Extract data using streaming trait method
+                // Extract data using streaming trait method with password support
                 let stream_vtable = *(out_stream as *const *const *const c_void);
                 let write_fn: WriteFn = std::mem::transmute(*stream_vtable.add(3));
 
@@ -539,7 +781,15 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
                     write_fn,
                 };
 
-                match handler.inner.extract_to(index, &mut writer) {
+                let extract_result = handler.inner.extract_to_with_password(
+                    index,
+                    &mut writer,
+                    password_requester
+                        .as_ref()
+                        .map(|p| p as &dyn PasswordRequester),
+                );
+
+                match extract_result {
                     Ok(_) => NRESULT_OK,
                     Err(_) => NRESULT_DATA_ERROR,
                 }
@@ -603,7 +853,7 @@ unsafe extern "system" fn get_number_of_properties<T: ArchiveReader>(
 ) -> HRESULT {
     unsafe {
         if !num_props.is_null() {
-            *num_props = 4; // Path, Size, PackSize, IsDir
+            *num_props = 10; // Path, Size, PackSize, IsDir, MTime, CTime, ATime, Attrib, CRC, Encrypted
         }
         S_OK
     }
@@ -617,7 +867,7 @@ unsafe extern "system" fn get_property_info<T: ArchiveReader>(
     var_type: *mut u32,
 ) -> HRESULT {
     unsafe {
-        use super::propvariant::{VT_BOOL, VT_BSTR, VT_UI8};
+        use super::propvariant::{VT_BOOL, VT_BSTR, VT_FILETIME, VT_UI4, VT_UI8};
 
         if name.is_null() || prop_id.is_null() || var_type.is_null() {
             return E_INVALIDARG;
@@ -640,6 +890,30 @@ unsafe extern "system" fn get_property_info<T: ArchiveReader>(
             }
             3 => {
                 *prop_id = PropId::IsDir as u32;
+                *var_type = VT_BOOL as u32;
+            }
+            4 => {
+                *prop_id = PropId::MTime as u32;
+                *var_type = VT_FILETIME as u32;
+            }
+            5 => {
+                *prop_id = PropId::CTime as u32;
+                *var_type = VT_FILETIME as u32;
+            }
+            6 => {
+                *prop_id = PropId::ATime as u32;
+                *var_type = VT_FILETIME as u32;
+            }
+            7 => {
+                *prop_id = PropId::Attrib as u32;
+                *var_type = VT_UI4 as u32;
+            }
+            8 => {
+                *prop_id = PropId::Crc as u32;
+                *var_type = VT_UI4 as u32;
+            }
+            9 => {
+                *prop_id = PropId::Encrypted as u32;
                 *var_type = VT_BOOL as u32;
             }
             _ => return E_INVALIDARG,
@@ -757,15 +1031,40 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
     update_callback: *mut c_void,
 ) -> HRESULT {
     unsafe {
-        let total_start = Instant::now();
-        eprintln!("[7zip-plugin] update_items called with {} items", num_items);
-
         let handler = &mut *out_vtbl_to_handler(this);
 
         if out_stream.is_null() || update_callback.is_null() {
             return E_INVALIDARG;
         }
 
+        // Inner function that does the actual work - allows us to use ? for early returns
+        // while ensuring cleanup always happens in the outer function
+        let result = update_items_inner(handler, out_stream, num_items, update_callback);
+
+        // ALWAYS clean up, regardless of success or failure
+        handler.inner.close();
+        handler.is_open = false;
+
+        if !handler.in_stream.is_null() {
+            let vtable = *(handler.in_stream as *const *const *const c_void);
+            let release_fn: ReleaseFn = std::mem::transmute(*vtable.add(2));
+            release_fn(handler.in_stream);
+            handler.in_stream = std::ptr::null_mut();
+        }
+
+        result
+    }
+}
+
+/// Inner implementation of update_items that can return early.
+/// Cleanup is handled by the caller.
+unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
+    handler: &mut PluginHandler<T>,
+    out_stream: *mut c_void,
+    num_items: u32,
+    update_callback: *mut c_void,
+) -> HRESULT {
+    unsafe {
         // Get callback vtable functions
         // IArchiveUpdateCallback vtable layout:
         // 0: QueryInterface, 1: AddRef, 2: Release (IUnknown)
@@ -823,9 +1122,7 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
         // Report total size to 7-Zip
         let _ = set_total(update_callback, total_size);
 
-        let mut completed: u64 = 0;
-
-        // Second pass: collect data with progress updates
+        // Second pass: collect data
         for i in 0..num_items {
             let mut new_data: i32 = 0;
             let mut new_props: i32 = 0;
@@ -843,6 +1140,23 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
             }
 
             if new_data != 0 {
+                // Check if this is a directory - skip directories as most archive
+                // formats don't need explicit directory entries (paths contain folders)
+                let mut is_dir_prop = RawPropVariant::default();
+                let _ = get_property(
+                    update_callback,
+                    i,
+                    PropId::IsDir as u32,
+                    &mut is_dir_prop as *mut _ as *mut c_void,
+                );
+                let is_dir = is_dir_prop.get_bool().unwrap_or(false);
+
+                if is_dir {
+                    // Skip directories - report success and continue
+                    let _ = set_operation_result(update_callback, NRESULT_OK);
+                    continue;
+                }
+
                 // New file - get name and data
                 let mut prop = RawPropVariant::default();
                 let hr = get_property(
@@ -875,23 +1189,17 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
                     Vec::new()
                 };
 
-                // Update progress
-                completed += data.len() as u64;
-                let _ = set_completed(update_callback, &completed);
+                // Don't report progress here - the plugin will report progress
+                // during update_streaming when the data is actually written.
 
                 updates.push(UpdateItem::AddNew { name, data });
 
                 // Report operation result for this item
                 let _ = set_operation_result(update_callback, NRESULT_OK);
-            } else {
-                // Copy existing item - update progress if we have item info
-                if index_in_archive != u32::MAX
-                    && let Some(item) = handler.inner.get_item(index_in_archive as usize)
-                {
-                    completed += item.size;
-                    let _ = set_completed(update_callback, &completed);
-                }
-
+            } else if index_in_archive != u32::MAX {
+                // Copy existing item - don't report progress here since no actual work
+                // is done during collection. Progress will be reported by the plugin
+                // during update_streaming when the data is actually processed.
                 updates.push(UpdateItem::CopyExisting {
                     index: index_in_archive as usize,
                     new_name: None,
@@ -900,9 +1208,9 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
                 // Report operation result for this item
                 let _ = set_operation_result(update_callback, NRESULT_OK);
             }
+            // else: item is being deleted (new_data == 0 && index_in_archive == MAX)
+            // - don't add to updates list, which removes it from the archive
         }
-
-        eprintln!("[7zip-plugin] Collection phase done in {:?}", total_start.elapsed());
 
         // Create streaming writer for output
         let stream_vtable = *(out_stream as *const *const *const c_void);
@@ -913,18 +1221,45 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
             write_fn,
         };
 
-        eprintln!("[7zip-plugin] Calling update_streaming...");
-        let update_start = Instant::now();
+        // Try to get password provider from update callback
+        // (for creating encrypted archives)
+        let password_provider = PasswordProviderWrapper::try_from_callback(update_callback);
+
+        // Create progress callback that reports to 7-Zip
+        // The inner format reports (completed, total) in whatever units make sense for it.
+        // We scale this to match total_size (what we told 7-Zip) using the ratio.
+        let mut progress_fn = |write_completed: u64, write_total: u64| -> bool {
+            let scaled = if write_total > 0 {
+                // Scale: (completed / total) * total_size
+                let ratio = write_completed as f64 / write_total as f64;
+                (ratio * total_size as f64).min(total_size as f64) as u64
+            } else {
+                0
+            };
+            let _ = set_completed(update_callback, &scaled);
+            true // continue operation
+        };
 
         // Create reader for existing archive (if we have one)
-        let result = if handler.in_stream.is_null() {
+        if handler.in_stream.is_null() {
             // No existing archive - create empty reader
             let mut empty_reader = std::io::Cursor::new(&[] as &[u8]);
-            match handler
-                .inner
-                .update_streaming(&mut empty_reader, 0, updates, &mut writer)
-            {
-                Ok(_) => S_OK,
+            let result = handler.inner.update_streaming_with_password(
+                &mut empty_reader,
+                0,
+                updates,
+                &mut writer,
+                Some(&mut progress_fn),
+                password_provider
+                    .as_ref()
+                    .map(|p| p as &dyn PasswordProvider),
+            );
+            match result {
+                Ok(_) => {
+                    // Report 100% completion after write phase finishes
+                    let _ = set_completed(update_callback, &total_size);
+                    S_OK
+                }
                 Err(_) => S_FALSE,
             }
         } else {
@@ -935,34 +1270,25 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
             };
             let size = reader.size();
 
-            match handler
-                .inner
-                .update_streaming(&mut reader, size, updates, &mut writer)
-            {
-                Ok(_) => S_OK,
+            let result = handler.inner.update_streaming_with_password(
+                &mut reader,
+                size,
+                updates,
+                &mut writer,
+                Some(&mut progress_fn),
+                password_provider
+                    .as_ref()
+                    .map(|p| p as &dyn PasswordProvider),
+            );
+            match result {
+                Ok(_) => {
+                    // Report 100% completion after write phase finishes
+                    let _ = set_completed(update_callback, &total_size);
+                    S_OK
+                }
                 Err(_) => S_FALSE,
             }
-        };
-
-        eprintln!("[7zip-plugin] update_streaming done in {:?}", update_start.elapsed());
-
-        // Release the input stream to allow 7-Zip to replace the original file
-        // This must happen after update completes but before we return
-        eprintln!("[7zip-plugin] Releasing in_stream...");
-        let release_start = Instant::now();
-
-        if !handler.in_stream.is_null() {
-            let vtable = *(handler.in_stream as *const *const *const c_void);
-            let release_fn: ReleaseFn = std::mem::transmute(*vtable.add(2));
-            release_fn(handler.in_stream);
-            handler.in_stream = std::ptr::null_mut();
-            handler.is_open = false;
         }
-
-        eprintln!("[7zip-plugin] in_stream released in {:?}", release_start.elapsed());
-        eprintln!("[7zip-plugin] Total update_items: {:?}", total_start.elapsed());
-
-        result
     }
 }
 

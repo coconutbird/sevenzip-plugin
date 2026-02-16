@@ -6,6 +6,8 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::SysFreeString;
 use windows::core::BSTR;
 
+use std::time::SystemTime;
+
 /// VT (variant type) constants.
 pub const VT_EMPTY: u16 = 0;
 pub const VT_UI4: u16 = 19;
@@ -13,6 +15,25 @@ pub const VT_UI8: u16 = 21;
 pub const VT_BSTR: u16 = 8;
 pub const VT_BOOL: u16 = 11;
 pub const VT_FILETIME: u16 = 64;
+
+/// Windows FILETIME epoch: January 1, 1601
+/// Difference between Unix epoch (1970) and Windows epoch (1601) in 100ns intervals
+const FILETIME_UNIX_DIFF: u64 = 116444736000000000;
+
+/// Convert a `SystemTime` to Windows FILETIME format (100ns intervals since 1601-01-01).
+pub fn systemtime_to_filetime(time: SystemTime) -> u64 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => {
+            // Convert to 100ns intervals and add the epoch difference
+            let nanos_100 = duration.as_nanos() / 100;
+            FILETIME_UNIX_DIFF + nanos_100 as u64
+        }
+        Err(_) => {
+            // Time is before Unix epoch - this is rare but possible
+            0
+        }
+    }
+}
 
 /// Raw 16-byte PROPVARIANT matching 7-Zip's expectations.
 ///
@@ -163,6 +184,25 @@ impl RawPropVariant {
         }
     }
 
+    /// Set a raw byte array value (for signature property).
+    ///
+    /// 7-Zip expects VT_BSTR containing the raw signature bytes.
+    ///
+    /// # Safety
+    /// - If this PROPVARIANT already contains a BSTR, the caller must call
+    ///   `clear()` first to avoid memory leaks.
+    /// - The caller must ensure 7-Zip properly frees the allocated BSTR.
+    pub unsafe fn set_bytes(&mut self, bytes: &[u8]) {
+        unsafe {
+            self.clear();
+            use windows::Win32::Foundation::SysAllocStringByteLen;
+
+            let bstr = SysAllocStringByteLen(Some(bytes));
+            self.vt = VT_BSTR;
+            self.data = bstr.into_raw() as u64;
+        }
+    }
+
     /// Extract a BSTR string from this PROPVARIANT.
     ///
     /// # Safety
@@ -204,6 +244,18 @@ impl RawPropVariant {
     pub fn get_u32(&self) -> Option<u32> {
         if self.vt == VT_UI4 {
             Some(self.data as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Extract a bool value from this PROPVARIANT.
+    ///
+    /// Returns `Some(value)` if the type is VT_BOOL, `None` otherwise.
+    /// VARIANT_TRUE = -1 (0xFFFF), VARIANT_FALSE = 0
+    pub fn get_bool(&self) -> Option<bool> {
+        if self.vt == VT_BOOL {
+            Some(self.data != 0)
         } else {
             None
         }

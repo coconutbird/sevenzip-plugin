@@ -7,6 +7,12 @@ use windows::core::{GUID, HRESULT};
 pub const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_C000_000000000046);
 pub const IID_IINARCHIVE: GUID = GUID::from_u128(0x23170f69_40c1_278a_0000_000600600000);
 pub const IID_IOUTARCHIVE: GUID = GUID::from_u128(0x23170f69_40c1_278a_0000_000600a00000);
+/// ICryptoGetTextPassword interface GUID (for reading encrypted archives)
+pub const IID_ICRYPTO_GET_TEXT_PASSWORD: GUID =
+    GUID::from_u128(0x23170f69_40c1_278a_0000_000500100000);
+/// ICryptoGetTextPassword2 interface GUID (for creating encrypted archives)
+pub const IID_ICRYPTO_GET_TEXT_PASSWORD2: GUID =
+    GUID::from_u128(0x23170f69_40c1_278a_0000_000500110000);
 
 /// Create a 7-Zip format GUID from the format ID byte.
 pub const fn make_format_guid(id: u8) -> GUID {
@@ -61,6 +67,8 @@ pub enum PropId {
     CTime = 10,
     ATime = 11,
     MTime = 12,
+    Crc = 19,
+    Encrypted = 21,
 }
 
 /// Archive property IDs.

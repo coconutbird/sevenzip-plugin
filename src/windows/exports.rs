@@ -291,6 +291,18 @@ pub fn get_handler_property2<T: crate::ArchiveFormat>(
             x if x == HandlerPropId::Update as u32 => {
                 prop.set_bool(T::supports_write());
             }
+            x if x == HandlerPropId::Signature as u32 => {
+                // Return signature bytes for format auto-detection
+                if let Some(sig) = T::signature() {
+                    prop.set_bytes(sig);
+                } else {
+                    prop.set_empty();
+                }
+            }
+            x if x == HandlerPropId::SignatureOffset as u32 => {
+                // Signature starts at offset 0 by default
+                prop.set_u32(0);
+            }
             _ => {
                 prop.set_empty();
             }
