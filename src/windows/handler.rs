@@ -8,14 +8,34 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Foundation::{
     E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, S_FALSE, S_OK,
 };
-use windows::core::{BSTR, GUID, HRESULT};
+use windows::core::{BSTR, HRESULT};
 
 use crate::traits::{ArchiveReader, ArchiveUpdater};
 
 use super::com::{
-    ArchivePropId, IID_ICRYPTO_GET_TEXT_PASSWORD, IID_ICRYPTO_GET_TEXT_PASSWORD2, IID_IINARCHIVE,
-    IID_IOUTARCHIVE, IID_IUNKNOWN, IInArchiveVtbl, IOutArchiveVtbl, PropId,
+    ArchivePropId,
+    GUID,
+    IArchiveExtractCallback,
+    IArchiveUpdateCallback,
+    ICryptoGetTextPassword,
+    ICryptoGetTextPassword2,
+    IID_ICRYPTOGETTEXTPASSWORD,
+    IID_ICRYPTOGETTEXTPASSWORD2,
+    IID_IINARCHIVE,
+    IID_IOUTARCHIVE,
+    IID_IUNKNOWN,
+    IInArchiveVTable,
+    IInStream,
+    IOutArchiveVTable,
+    // Stream and callback wrapper types
+    ISequentialInStream,
+    ISequentialOutStream,
+    PropId,
 };
+
+// Import IUnknownVTable for vtable base field initialization
+use cppvtable::IUnknownVTable;
+
 use super::propvariant::RawPropVariant;
 use crate::types::{PasswordProvider, PasswordRequester};
 
@@ -34,22 +54,14 @@ pub(crate) unsafe fn read_sequential_stream(stream: *mut c_void) -> std::io::Res
             ));
         }
 
-        type ReadFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32) -> HRESULT;
-
-        let vtable = *(stream as *const *const *const c_void);
-        let read_fn: ReadFn = std::mem::transmute(*vtable.add(3));
+        let stream = ISequentialInStream::<c_void>::from_ptr_mut(stream);
 
         let mut data = Vec::new();
         let mut buffer = [0u8; 65536];
 
         loop {
             let mut bytes_read: u32 = 0;
-            let hr = read_fn(
-                stream,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                &mut bytes_read,
-            );
+            let hr = stream.read(buffer.as_mut_ptr(), buffer.len() as u32, &mut bytes_read);
             if hr.is_err() {
                 return Err(std::io::Error::other(format!("Read failed: {:?}", hr)));
             }
@@ -67,18 +79,12 @@ pub(crate) unsafe fn read_sequential_stream(stream: *mut c_void) -> std::io::Res
 // Streaming Input Reader
 // =============================================================================
 
-// Function pointer types for IInStream
-type InStreamReadFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32) -> HRESULT;
-type InStreamSeekFn = unsafe extern "system" fn(*mut c_void, i64, u32, *mut u64) -> HRESULT;
-
 /// Wrapper for IInStream that implements `std::io::Read + Seek`.
 ///
 /// This allows zero-copy streaming reads from 7-Zip's input stream,
 /// avoiding the need to buffer the entire archive in memory.
 pub struct InStreamReader {
     stream: *mut c_void,
-    read_fn: InStreamReadFn,
-    seek_fn: InStreamSeekFn,
     size: u64,
 }
 
@@ -96,13 +102,11 @@ impl InStreamReader {
                 ));
             }
 
-            let vtable = *(stream as *const *const *const c_void);
-            let read_fn: InStreamReadFn = std::mem::transmute(*vtable.add(3));
-            let seek_fn: InStreamSeekFn = std::mem::transmute(*vtable.add(4));
+            let in_stream = IInStream::<c_void>::from_ptr_mut(stream);
 
             // Get stream size by seeking to end
             let mut size: u64 = 0;
-            let hr = seek_fn(stream, 0, STREAM_SEEK_END, &mut size);
+            let hr = in_stream.seek(0, STREAM_SEEK_END, &mut size);
             if hr.is_err() {
                 return Err(std::io::Error::other(format!(
                     "Failed to get stream size: {:?}",
@@ -112,7 +116,7 @@ impl InStreamReader {
 
             // Seek back to start
             let mut pos: u64 = 0;
-            let hr = seek_fn(stream, 0, STREAM_SEEK_SET, &mut pos);
+            let hr = in_stream.seek(0, STREAM_SEEK_SET, &mut pos);
             if hr.is_err() {
                 return Err(std::io::Error::other(format!(
                     "Failed to seek to start: {:?}",
@@ -120,18 +124,19 @@ impl InStreamReader {
                 )));
             }
 
-            Ok(Self {
-                stream,
-                read_fn,
-                seek_fn,
-                size,
-            })
+            Ok(Self { stream, size })
         }
     }
 
     /// Get the total size of the stream in bytes.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Get the underlying stream as a typed wrapper.
+    #[inline]
+    fn as_stream(&mut self) -> &mut IInStream<c_void> {
+        unsafe { IInStream::<c_void>::from_ptr_mut(self.stream) }
     }
 }
 
@@ -144,8 +149,10 @@ impl Read for InStreamReader {
         let chunk_size = buf.len().min(u32::MAX as usize) as u32;
         let mut bytes_read: u32 = 0;
 
-        let hr =
-            unsafe { (self.read_fn)(self.stream, buf.as_mut_ptr(), chunk_size, &mut bytes_read) };
+        let hr = unsafe {
+            self.as_stream()
+                .read(buf.as_mut_ptr(), chunk_size, &mut bytes_read)
+        };
 
         if hr.is_err() {
             return Err(std::io::Error::other(format!(
@@ -167,7 +174,7 @@ impl Seek for InStreamReader {
         };
 
         let mut new_pos: u64 = 0;
-        let hr = unsafe { (self.seek_fn)(self.stream, offset, origin, &mut new_pos) };
+        let hr = unsafe { self.as_stream().seek(offset, origin, &mut new_pos) };
 
         if hr.is_err() {
             return Err(std::io::Error::other(format!(
@@ -190,9 +197,9 @@ impl Seek for InStreamReader {
 #[repr(C)]
 pub struct PluginHandler<T: ArchiveReader> {
     /// Pointer to IInArchive vtable - MUST be first field for COM compatibility
-    pub in_vtbl: *const IInArchiveVtbl<Self>,
+    pub in_vtbl: *const IInArchiveVTable<Self>,
     /// Pointer to IOutArchive vtable - for writing support
-    pub out_vtbl: *const IOutArchiveVtbl<Self>,
+    pub out_vtbl: *const IOutArchiveVTable<Self>,
     /// Reference count
     ref_count: AtomicU32,
     /// The actual archive implementation (safe Rust)
@@ -271,9 +278,7 @@ unsafe extern "system" fn release<T: ArchiveReader>(this: *mut PluginHandler<T>)
             // Release the input stream before destroying the handler
             let handler = &mut *this;
             if !handler.in_stream.is_null() {
-                let vtable = *(handler.in_stream as *const *const *const c_void);
-                let release_fn: ReleaseFn = std::mem::transmute(*vtable.add(2));
-                release_fn(handler.in_stream);
+                IInStream::<c_void>::from_ptr_mut(handler.in_stream).release();
                 handler.in_stream = std::ptr::null_mut();
             }
             handler.inner.close();
@@ -286,13 +291,6 @@ unsafe extern "system" fn release<T: ArchiveReader>(this: *mut PluginHandler<T>)
 // =============================================================================
 // IInArchive implementation
 // =============================================================================
-
-// COM AddRef function type
-type AddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
-type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
-type QueryInterfaceFn =
-    unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
-type CryptoGetTextPasswordFn = unsafe extern "system" fn(*mut c_void, *mut BSTR) -> HRESULT;
 
 /// Wrapper around 7-Zip's ICryptoGetTextPassword interface.
 ///
@@ -311,16 +309,10 @@ impl PasswordRequesterWrapper {
         }
 
         unsafe {
-            // QueryInterface for ICryptoGetTextPassword
-            let vtable = *(open_callback as *const *const *const c_void);
-            let query_interface: QueryInterfaceFn = std::mem::transmute(*vtable);
-
+            // Use the wrapper to QueryInterface for ICryptoGetTextPassword
+            let callback = IArchiveExtractCallback::<c_void>::from_ptr_mut(open_callback);
             let mut crypto_ptr: *mut c_void = std::ptr::null_mut();
-            let hr = query_interface(
-                open_callback,
-                &IID_ICRYPTO_GET_TEXT_PASSWORD,
-                &mut crypto_ptr,
-            );
+            let hr = callback.query_interface(&IID_ICRYPTOGETTEXTPASSWORD, &mut crypto_ptr);
 
             if hr.is_ok() && !crypto_ptr.is_null() {
                 Some(Self {
@@ -336,23 +328,25 @@ impl PasswordRequesterWrapper {
 impl PasswordRequester for PasswordRequesterWrapper {
     fn get_password(&self) -> crate::error::Result<Option<String>> {
         unsafe {
-            let vtable = *(self.crypto_callback as *const *const *const c_void);
-            // ICryptoGetTextPassword vtable: QueryInterface, AddRef, Release, CryptoGetTextPassword
-            let get_password: CryptoGetTextPasswordFn = std::mem::transmute(*vtable.add(3));
+            let crypto = ICryptoGetTextPassword::<c_void>::from_ptr_mut(self.crypto_callback);
 
-            let mut bstr = BSTR::default();
-            let hr = get_password(self.crypto_callback, &mut bstr);
+            let mut password_ptr: *mut u16 = std::ptr::null_mut();
+            let hr = crypto.crypto_get_text_password(&mut password_ptr);
 
             if hr.is_err() {
                 return Ok(None); // User cancelled or error
             }
 
-            if bstr.is_empty() {
+            if password_ptr.is_null() {
                 return Ok(Some(String::new()));
             }
 
-            // Convert BSTR to String - BSTR will be freed when dropped
+            // Convert BSTR (which is *mut u16) to String
+            // BSTR layout: length prefix at ptr-2, null-terminated UTF-16 string
+            let bstr = BSTR::from_raw(password_ptr);
             let password = bstr.to_string();
+            // Don't drop the BSTR - 7-Zip owns it
+            std::mem::forget(bstr);
 
             Ok(Some(password))
         }
@@ -363,17 +357,11 @@ impl Drop for PasswordRequesterWrapper {
     fn drop(&mut self) {
         unsafe {
             if !self.crypto_callback.is_null() {
-                let vtable = *(self.crypto_callback as *const *const *const c_void);
-                let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
-                release(self.crypto_callback);
+                ICryptoGetTextPassword::<c_void>::from_ptr_mut(self.crypto_callback).release();
             }
         }
     }
 }
-
-/// Function type for ICryptoGetTextPassword2::CryptoGetTextPassword2
-type CryptoGetTextPassword2Fn =
-    unsafe extern "system" fn(*mut c_void, *mut i32, *mut BSTR) -> HRESULT;
 
 /// Wrapper around 7-Zip's ICryptoGetTextPassword2 interface.
 ///
@@ -392,16 +380,10 @@ impl PasswordProviderWrapper {
         }
 
         unsafe {
-            // QueryInterface for ICryptoGetTextPassword2
-            let vtable = *(update_callback as *const *const *const c_void);
-            let query_interface: QueryInterfaceFn = std::mem::transmute(*vtable);
-
+            // Use wrapper to QueryInterface for ICryptoGetTextPassword2
+            let callback = IArchiveUpdateCallback::<c_void>::from_ptr_mut(update_callback);
             let mut crypto_ptr: *mut c_void = std::ptr::null_mut();
-            let hr = query_interface(
-                update_callback,
-                &IID_ICRYPTO_GET_TEXT_PASSWORD2,
-                &mut crypto_ptr,
-            );
+            let hr = callback.query_interface(&IID_ICRYPTOGETTEXTPASSWORD2, &mut crypto_ptr);
 
             if hr.is_ok() && !crypto_ptr.is_null() {
                 Some(Self {
@@ -417,13 +399,11 @@ impl PasswordProviderWrapper {
 impl PasswordProvider for PasswordProviderWrapper {
     fn get_password(&self) -> crate::error::Result<Option<String>> {
         unsafe {
-            let vtable = *(self.crypto_callback as *const *const *const c_void);
-            // ICryptoGetTextPassword2 vtable: QueryInterface, AddRef, Release, CryptoGetTextPassword2
-            let get_password2: CryptoGetTextPassword2Fn = std::mem::transmute(*vtable.add(3));
+            let crypto = ICryptoGetTextPassword2::<c_void>::from_ptr_mut(self.crypto_callback);
 
             let mut password_is_defined: i32 = 0;
-            let mut bstr = BSTR::default();
-            let hr = get_password2(self.crypto_callback, &mut password_is_defined, &mut bstr);
+            let mut password_ptr: *mut u16 = std::ptr::null_mut();
+            let hr = crypto.crypto_get_text_password2(&mut password_is_defined, &mut password_ptr);
 
             if hr.is_err() {
                 return Ok(None); // Error getting password
@@ -434,12 +414,15 @@ impl PasswordProvider for PasswordProviderWrapper {
                 return Ok(None);
             }
 
-            if bstr.is_empty() {
+            if password_ptr.is_null() {
                 return Ok(Some(String::new()));
             }
 
-            // Convert BSTR to String - BSTR will be freed when dropped
+            // Convert BSTR (which is *mut u16) to String
+            let bstr = BSTR::from_raw(password_ptr);
             let password = bstr.to_string();
+            // Don't drop the BSTR - 7-Zip owns it
+            std::mem::forget(bstr);
 
             Ok(Some(password))
         }
@@ -450,9 +433,7 @@ impl Drop for PasswordProviderWrapper {
     fn drop(&mut self) {
         unsafe {
             if !self.crypto_callback.is_null() {
-                let vtable = *(self.crypto_callback as *const *const *const c_void);
-                let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
-                release(self.crypto_callback);
+                ICryptoGetTextPassword2::<c_void>::from_ptr_mut(self.crypto_callback).release();
             }
         }
     }
@@ -474,9 +455,7 @@ unsafe extern "system" fn open<T: ArchiveReader>(
         // Release any existing stream before opening a new one
         // This can happen if 7-Zip reopens the archive after an update
         if !handler.in_stream.is_null() {
-            let old_vtable = *(handler.in_stream as *const *const *const c_void);
-            let release: ReleaseFn = std::mem::transmute(*old_vtable.add(2));
-            release(handler.in_stream);
+            IInStream::<c_void>::from_ptr_mut(handler.in_stream).release();
             handler.in_stream = std::ptr::null_mut();
         }
 
@@ -515,9 +494,7 @@ unsafe extern "system" fn open<T: ArchiveReader>(
         }
 
         // AddRef the stream to keep it alive while we have it
-        let vtable = *(stream as *const *const *const c_void);
-        let add_ref: AddRefFn = std::mem::transmute(*vtable.add(1));
-        add_ref(stream);
+        IInStream::<c_void>::from_ptr_mut(stream).add_ref();
 
         handler.in_stream = stream;
         handler.archive_size = size;
@@ -533,9 +510,7 @@ unsafe extern "system" fn close<T: ArchiveReader>(this: *mut PluginHandler<T>) -
 
         // Release the input stream if we have one
         if !handler.in_stream.is_null() {
-            let vtable = *(handler.in_stream as *const *const *const c_void);
-            let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
-            release(handler.in_stream);
+            IInStream::<c_void>::from_ptr_mut(handler.in_stream).release();
             handler.in_stream = std::ptr::null_mut();
         }
 
@@ -646,21 +621,25 @@ const NASK_EXTRACT: i32 = 0;
 const NRESULT_OK: i32 = 0;
 const NRESULT_DATA_ERROR: i32 = 1;
 
-// Callback function types
-type SetTotalFn = unsafe extern "system" fn(*mut c_void, u64) -> HRESULT;
-type SetCompletedFn = unsafe extern "system" fn(*mut c_void, *const u64) -> HRESULT;
-type GetStreamFn = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void, i32) -> HRESULT;
-type PrepareOperationFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESULT;
-type SetOperationResultFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESULT;
-type WriteFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32) -> HRESULT;
-
 /// Wrapper for ISequentialOutStream that implements `std::io::Write`.
 ///
 /// This allows streaming writes directly to 7-Zip's output stream,
 /// avoiding intermediate allocations.
 struct SeqOutStreamWriter {
     stream: *mut c_void,
-    write_fn: WriteFn,
+}
+
+impl SeqOutStreamWriter {
+    /// Create a new SeqOutStreamWriter from a raw ISequentialOutStream pointer.
+    fn new(stream: *mut c_void) -> Self {
+        Self { stream }
+    }
+
+    /// Get the underlying stream as a typed wrapper.
+    #[inline]
+    fn as_stream(&mut self) -> &mut ISequentialOutStream<c_void> {
+        unsafe { ISequentialOutStream::<c_void>::from_ptr_mut(self.stream) }
+    }
 }
 
 impl std::io::Write for SeqOutStreamWriter {
@@ -673,7 +652,10 @@ impl std::io::Write for SeqOutStreamWriter {
         let mut written: u32 = 0;
 
         // Safety: we're calling the COM method with valid pointers
-        let hr = unsafe { (self.write_fn)(self.stream, buf.as_ptr(), chunk_size, &mut written) };
+        let hr = unsafe {
+            self.as_stream()
+                .write(buf.as_ptr(), chunk_size, &mut written)
+        };
 
         if hr.is_err() {
             return Err(std::io::Error::other(format!(
@@ -712,13 +694,8 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
             return E_INVALIDARG;
         }
 
-        // Get callback vtable functions
-        let cb_vtable = *(extract_callback as *const *const *const c_void);
-        let set_total: SetTotalFn = std::mem::transmute(*cb_vtable.add(3));
-        let set_completed: SetCompletedFn = std::mem::transmute(*cb_vtable.add(4));
-        let get_stream: GetStreamFn = std::mem::transmute(*cb_vtable.add(5));
-        let prepare_operation: PrepareOperationFn = std::mem::transmute(*cb_vtable.add(6));
-        let set_operation_result: SetOperationResultFn = std::mem::transmute(*cb_vtable.add(7));
+        // Get callback wrapper for type-safe method calls
+        let callback = IArchiveExtractCallback::<c_void>::from_ptr_mut(extract_callback);
 
         // Try to get password requester from extract callback
         // (for formats like ZIP where individual files can be encrypted)
@@ -742,7 +719,7 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
             .map(|item| item.size)
             .sum();
 
-        let _ = set_total(extract_callback, total_size);
+        let _ = callback.set_total(total_size);
 
         let mut completed: u64 = 0;
 
@@ -755,31 +732,20 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
 
             // Get output stream
             let mut out_stream: *mut c_void = std::ptr::null_mut();
-            let hr = get_stream(
-                extract_callback,
-                index as u32,
-                &mut out_stream,
-                NASK_EXTRACT,
-            );
+            let hr = callback.get_stream(index as u32, &mut out_stream, NASK_EXTRACT);
             if hr.is_err() {
                 return hr;
             }
 
             // Prepare operation
-            let _ = prepare_operation(extract_callback, NASK_EXTRACT);
+            let _ = callback.prepare_operation(NASK_EXTRACT);
 
             // If test mode or no stream, skip extraction
             let result = if test_mode != 0 || out_stream.is_null() {
                 NRESULT_OK
             } else {
                 // Extract data using streaming trait method with password support
-                let stream_vtable = *(out_stream as *const *const *const c_void);
-                let write_fn: WriteFn = std::mem::transmute(*stream_vtable.add(3));
-
-                let mut writer = SeqOutStreamWriter {
-                    stream: out_stream,
-                    write_fn,
-                };
+                let mut writer = SeqOutStreamWriter::new(out_stream);
 
                 let extract_result = handler.inner.extract_to_with_password(
                     index,
@@ -797,20 +763,18 @@ unsafe extern "system" fn extract<T: ArchiveReader>(
 
             // Release output stream
             if !out_stream.is_null() {
-                let stream_vtable = *(out_stream as *const *const *const c_void);
-                let release_fn: ReleaseFn = std::mem::transmute(*stream_vtable.add(2));
-                release_fn(out_stream);
+                ISequentialOutStream::<c_void>::from_ptr_mut(out_stream).release();
             }
 
             // Set operation result
-            let hr = set_operation_result(extract_callback, result);
+            let hr = callback.set_operation_result(result);
             if hr.is_err() {
                 return hr;
             }
 
             // Update progress
             completed += item_size;
-            let _ = set_completed(extract_callback, &completed);
+            let _ = callback.set_completed(&completed);
         }
 
         S_OK
@@ -1017,13 +981,6 @@ unsafe extern "system" fn get_file_time_type<T: ArchiveReader>(
     }
 }
 
-// Update callback function types
-type GetUpdateItemInfoFn =
-    unsafe extern "system" fn(*mut c_void, u32, *mut i32, *mut i32, *mut u32) -> HRESULT;
-type GetPropertyFn = unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void) -> HRESULT;
-type GetStreamFnUpdate = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
-type SetOperationResultUpdateFn = unsafe extern "system" fn(*mut c_void, i32) -> HRESULT;
-
 unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
     this: *mut PluginHandler<T>,
     out_stream: *mut c_void,
@@ -1046,9 +1003,7 @@ unsafe extern "system" fn update_items<T: ArchiveReader + ArchiveUpdater>(
         handler.is_open = false;
 
         if !handler.in_stream.is_null() {
-            let vtable = *(handler.in_stream as *const *const *const c_void);
-            let release_fn: ReleaseFn = std::mem::transmute(*vtable.add(2));
-            release_fn(handler.in_stream);
+            IInStream::<c_void>::from_ptr_mut(handler.in_stream).release();
             handler.in_stream = std::ptr::null_mut();
         }
 
@@ -1065,19 +1020,8 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
     update_callback: *mut c_void,
 ) -> HRESULT {
     unsafe {
-        // Get callback vtable functions
-        // IArchiveUpdateCallback vtable layout:
-        // 0: QueryInterface, 1: AddRef, 2: Release (IUnknown)
-        // 3: SetTotal, 4: SetCompleted (IProgress)
-        // 5: GetUpdateItemInfo, 6: GetProperty, 7: GetStream, 8: SetOperationResult
-        let cb_vtable = *(update_callback as *const *const *const c_void);
-        let set_total: SetTotalFn = std::mem::transmute(*cb_vtable.add(3));
-        let set_completed: SetCompletedFn = std::mem::transmute(*cb_vtable.add(4));
-        let get_update_item_info: GetUpdateItemInfoFn = std::mem::transmute(*cb_vtable.add(5));
-        let get_property: GetPropertyFn = std::mem::transmute(*cb_vtable.add(6));
-        let get_stream: GetStreamFnUpdate = std::mem::transmute(*cb_vtable.add(7));
-        let set_operation_result: SetOperationResultUpdateFn =
-            std::mem::transmute(*cb_vtable.add(8));
+        // Get callback wrapper for type-safe method calls
+        let callback = IArchiveUpdateCallback::<c_void>::from_ptr_mut(update_callback);
 
         use crate::types::UpdateItem;
         let mut updates = Vec::new();
@@ -1089,8 +1033,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
             let mut new_props: i32 = 0;
             let mut index_in_archive: u32 = u32::MAX;
 
-            let hr = get_update_item_info(
-                update_callback,
+            let hr = callback.get_update_item_info(
                 i,
                 &mut new_data,
                 &mut new_props,
@@ -1103,8 +1046,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
             if new_data != 0 {
                 // New file - get size property for progress tracking
                 let mut size_prop = RawPropVariant::default();
-                let _ = get_property(
-                    update_callback,
+                let _ = callback.get_property(
                     i,
                     PropId::Size as u32,
                     &mut size_prop as *mut _ as *mut c_void,
@@ -1120,7 +1062,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
         }
 
         // Report total size to 7-Zip
-        let _ = set_total(update_callback, total_size);
+        let _ = callback.set_total(total_size);
 
         // Second pass: collect data
         for i in 0..num_items {
@@ -1128,8 +1070,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
             let mut new_props: i32 = 0;
             let mut index_in_archive: u32 = u32::MAX;
 
-            let hr = get_update_item_info(
-                update_callback,
+            let hr = callback.get_update_item_info(
                 i,
                 &mut new_data,
                 &mut new_props,
@@ -1143,8 +1084,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
                 // Check if this is a directory - skip directories as most archive
                 // formats don't need explicit directory entries (paths contain folders)
                 let mut is_dir_prop = RawPropVariant::default();
-                let _ = get_property(
-                    update_callback,
+                let _ = callback.get_property(
                     i,
                     PropId::IsDir as u32,
                     &mut is_dir_prop as *mut _ as *mut c_void,
@@ -1153,14 +1093,13 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
 
                 if is_dir {
                     // Skip directories - report success and continue
-                    let _ = set_operation_result(update_callback, NRESULT_OK);
+                    let _ = callback.set_operation_result(NRESULT_OK);
                     continue;
                 }
 
                 // New file - get name and data
                 let mut prop = RawPropVariant::default();
-                let hr = get_property(
-                    update_callback,
+                let hr = callback.get_property(
                     i,
                     PropId::Path as u32,
                     &mut prop as *mut _ as *mut c_void,
@@ -1173,7 +1112,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
 
                 // Get input stream
                 let mut in_stream: *mut c_void = std::ptr::null_mut();
-                let hr = get_stream(update_callback, i, &mut in_stream);
+                let hr = callback.get_stream(i, &mut in_stream);
                 if hr.is_err() {
                     return hr;
                 }
@@ -1181,9 +1120,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
                 let data = if !in_stream.is_null() {
                     let result = read_sequential_stream(in_stream);
                     // Release stream
-                    let stream_vtable = *(in_stream as *const *const *const c_void);
-                    let release_fn: ReleaseFn = std::mem::transmute(*stream_vtable.add(2));
-                    release_fn(in_stream);
+                    ISequentialInStream::<c_void>::from_ptr_mut(in_stream).release();
                     result.unwrap_or_default()
                 } else {
                     Vec::new()
@@ -1195,7 +1132,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
                 updates.push(UpdateItem::AddNew { name, data });
 
                 // Report operation result for this item
-                let _ = set_operation_result(update_callback, NRESULT_OK);
+                let _ = callback.set_operation_result(NRESULT_OK);
             } else if index_in_archive != u32::MAX {
                 // Copy existing item - don't report progress here since no actual work
                 // is done during collection. Progress will be reported by the plugin
@@ -1206,20 +1143,14 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
                 });
 
                 // Report operation result for this item
-                let _ = set_operation_result(update_callback, NRESULT_OK);
+                let _ = callback.set_operation_result(NRESULT_OK);
             }
             // else: item is being deleted (new_data == 0 && index_in_archive == MAX)
             // - don't add to updates list, which removes it from the archive
         }
 
         // Create streaming writer for output
-        let stream_vtable = *(out_stream as *const *const *const c_void);
-        let write_fn: WriteFn = std::mem::transmute(*stream_vtable.add(3));
-
-        let mut writer = SeqOutStreamWriter {
-            stream: out_stream,
-            write_fn,
-        };
+        let mut writer = SeqOutStreamWriter::new(out_stream);
 
         // Try to get password provider from update callback
         // (for creating encrypted archives)
@@ -1236,7 +1167,7 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
             } else {
                 0
             };
-            let _ = set_completed(update_callback, &scaled);
+            let _ = callback.set_completed(&scaled);
             true // continue operation
         };
 
@@ -1257,7 +1188,9 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
             match result {
                 Ok(_) => {
                     // Report 100% completion after write phase finishes
-                    let _ = set_completed(update_callback, &total_size);
+                    // Re-get the callback wrapper since progress_fn borrowed it
+                    let cb = IArchiveUpdateCallback::<c_void>::from_ptr_mut(update_callback);
+                    let _ = cb.set_completed(&total_size);
                     S_OK
                 }
                 Err(_) => S_FALSE,
@@ -1283,7 +1216,9 @@ unsafe fn update_items_inner<T: ArchiveReader + ArchiveUpdater>(
             match result {
                 Ok(_) => {
                     // Report 100% completion after write phase finishes
-                    let _ = set_completed(update_callback, &total_size);
+                    // Re-get the callback wrapper since progress_fn borrowed it
+                    let cb = IArchiveUpdateCallback::<c_void>::from_ptr_mut(update_callback);
+                    let _ = cb.set_completed(&total_size);
                     S_OK
                 }
                 Err(_) => S_FALSE,
@@ -1309,11 +1244,13 @@ unsafe extern "system" fn update_items_stub<T: ArchiveReader>(
 /// Creates the static IInArchive vtable for a format type.
 ///
 /// This is used internally by the registration macro.
-pub const fn create_in_vtable<T: ArchiveReader>() -> IInArchiveVtbl<PluginHandler<T>> {
-    IInArchiveVtbl {
-        query_interface: query_interface::<T>,
-        add_ref: add_ref::<T>,
-        release: release::<T>,
+pub const fn create_in_vtable<T: ArchiveReader>() -> IInArchiveVTable<PluginHandler<T>> {
+    IInArchiveVTable {
+        base: IUnknownVTable {
+            query_interface: query_interface::<T>,
+            add_ref: add_ref::<T>,
+            release: release::<T>,
+        },
         open: open::<T>,
         close: close::<T>,
         get_number_of_items: get_number_of_items::<T>,
@@ -1328,11 +1265,13 @@ pub const fn create_in_vtable<T: ArchiveReader>() -> IInArchiveVtbl<PluginHandle
 }
 
 /// Creates the static IOutArchive vtable for a format type (stub version).
-pub const fn create_out_vtable_stub<T: ArchiveReader>() -> IOutArchiveVtbl<PluginHandler<T>> {
-    IOutArchiveVtbl {
-        query_interface: out_query_interface::<T>,
-        add_ref: out_add_ref::<T>,
-        release: out_release::<T>,
+pub const fn create_out_vtable_stub<T: ArchiveReader>() -> IOutArchiveVTable<PluginHandler<T>> {
+    IOutArchiveVTable {
+        base: IUnknownVTable {
+            query_interface: out_query_interface::<T>,
+            add_ref: out_add_ref::<T>,
+            release: out_release::<T>,
+        },
         update_items: update_items_stub::<T>,
         get_file_time_type: get_file_time_type::<T>,
     }
@@ -1340,11 +1279,13 @@ pub const fn create_out_vtable_stub<T: ArchiveReader>() -> IOutArchiveVtbl<Plugi
 
 /// Creates the static IOutArchive vtable for a format type that supports updates.
 pub const fn create_out_vtable<T: ArchiveReader + ArchiveUpdater>()
--> IOutArchiveVtbl<PluginHandler<T>> {
-    IOutArchiveVtbl {
-        query_interface: out_query_interface::<T>,
-        add_ref: out_add_ref::<T>,
-        release: out_release::<T>,
+-> IOutArchiveVTable<PluginHandler<T>> {
+    IOutArchiveVTable {
+        base: IUnknownVTable {
+            query_interface: out_query_interface::<T>,
+            add_ref: out_add_ref::<T>,
+            release: out_release::<T>,
+        },
         update_items: update_items::<T>,
         get_file_time_type: get_file_time_type::<T>,
     }
@@ -1352,8 +1293,8 @@ pub const fn create_out_vtable<T: ArchiveReader + ArchiveUpdater>()
 
 /// A registered format with vtables and metadata.
 pub struct RegisteredFormat<T: ArchiveReader> {
-    pub in_vtbl: &'static IInArchiveVtbl<PluginHandler<T>>,
-    pub out_vtbl: &'static IOutArchiveVtbl<PluginHandler<T>>,
+    pub in_vtbl: &'static IInArchiveVTable<PluginHandler<T>>,
+    pub out_vtbl: &'static IOutArchiveVTable<PluginHandler<T>>,
     _phantom: PhantomData<T>,
 }
 
@@ -1367,8 +1308,8 @@ unsafe impl<T: ArchiveReader> Sync for RegisteredFormat<T> {}
 impl<T: ArchiveReader> RegisteredFormat<T> {
     /// Create a new registered format with the given vtables.
     pub const fn new(
-        in_vtbl: &'static IInArchiveVtbl<PluginHandler<T>>,
-        out_vtbl: &'static IOutArchiveVtbl<PluginHandler<T>>,
+        in_vtbl: &'static IInArchiveVTable<PluginHandler<T>>,
+        out_vtbl: &'static IOutArchiveVTable<PluginHandler<T>>,
     ) -> Self {
         Self {
             in_vtbl,

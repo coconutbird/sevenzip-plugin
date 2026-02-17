@@ -34,11 +34,11 @@ macro_rules! register_format {
     // Read-only format (no updatable flag)
     ($format:ty) => {
         // Static vtables
-        static IN_VTBL: $crate::windows::com::IInArchiveVtbl<
+        static IN_VTBL: $crate::windows::com::IInArchiveVTable<
             $crate::windows::handler::PluginHandler<$format>,
         > = $crate::windows::handler::create_in_vtable::<$format>();
 
-        static OUT_VTBL: $crate::windows::com::IOutArchiveVtbl<
+        static OUT_VTBL: $crate::windows::com::IOutArchiveVTable<
             $crate::windows::handler::PluginHandler<$format>,
         > = $crate::windows::handler::create_out_vtable_stub::<$format>();
 
@@ -93,11 +93,11 @@ macro_rules! register_format {
     // Updatable format (with updatable flag)
     ($format:ty, updatable) => {
         // Static vtables
-        static IN_VTBL: $crate::windows::com::IInArchiveVtbl<
+        static IN_VTBL: $crate::windows::com::IInArchiveVTable<
             $crate::windows::handler::PluginHandler<$format>,
         > = $crate::windows::handler::create_in_vtable::<$format>();
 
-        static OUT_VTBL: $crate::windows::com::IOutArchiveVtbl<
+        static OUT_VTBL: $crate::windows::com::IOutArchiveVTable<
             $crate::windows::handler::PluginHandler<$format>,
         > = $crate::windows::handler::create_out_vtable::<$format>();
 

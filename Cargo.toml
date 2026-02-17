@@ -15,6 +15,7 @@ debug = []
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
+cppvtable = { git = "https://github.com/coconutbird/cppvtable.git", features = ["windows-compat"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
