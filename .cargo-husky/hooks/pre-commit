@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-commit hook to check code formatting and lints
+
+# Check formatting
+cargo fmt --check
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ Code is not formatted. Run 'cargo fmt' to fix."
+    echo ""
+    exit 1
+fi
+
+# Run clippy
+cargo clippy --all-targets --all-features -- -D warnings
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ Clippy found issues. Fix the warnings above."
+    echo ""
+    exit 1
+fi
+
+exit 0

@@ -31,16 +31,15 @@ use super::propvariant::RawPropVariant;
 /// ```
 #[macro_export]
 macro_rules! register_format {
-    // Read-only format (no updatable flag)
-    ($format:ty) => {
-        // Static vtables
+    // Internal implementation - shared by both variants
+    (@impl $format:ty, $out_vtbl_fn:path) => {
         static IN_VTBL: $crate::windows::com::IInArchiveVTable<
             $crate::windows::handler::PluginHandler<$format>,
         > = $crate::windows::handler::create_in_vtable::<$format>();
 
         static OUT_VTBL: $crate::windows::com::IOutArchiveVTable<
             $crate::windows::handler::PluginHandler<$format>,
-        > = $crate::windows::handler::create_out_vtable_stub::<$format>();
+        > = $out_vtbl_fn();
 
         static REGISTERED_FORMAT: $crate::windows::handler::RegisteredFormat<$format> =
             $crate::windows::handler::RegisteredFormat::new(&IN_VTBL, &OUT_VTBL);
@@ -88,83 +87,51 @@ macro_rules! register_format {
                 )
             }
         }
+    };
+
+    // Read-only format (no updatable flag)
+    ($format:ty) => {
+        $crate::register_format!(@impl $format, $crate::windows::handler::create_out_vtable_stub::<$format>);
     };
 
     // Updatable format (with updatable flag)
     ($format:ty, updatable) => {
-        // Static vtables
-        static IN_VTBL: $crate::windows::com::IInArchiveVTable<
-            $crate::windows::handler::PluginHandler<$format>,
-        > = $crate::windows::handler::create_in_vtable::<$format>();
-
-        static OUT_VTBL: $crate::windows::com::IOutArchiveVTable<
-            $crate::windows::handler::PluginHandler<$format>,
-        > = $crate::windows::handler::create_out_vtable::<$format>();
-
-        static REGISTERED_FORMAT: $crate::windows::handler::RegisteredFormat<$format> =
-            $crate::windows::handler::RegisteredFormat::new(&IN_VTBL, &OUT_VTBL);
-
-        #[unsafe(no_mangle)]
-        pub unsafe extern "system" fn CreateObject(
-            clsid: *const $crate::windows_crate::core::GUID,
-            iid: *const $crate::windows_crate::core::GUID,
-            out_object: *mut *mut ::std::ffi::c_void,
-        ) -> $crate::windows_crate::core::HRESULT {
-            unsafe {
-                $crate::windows::exports::create_object::<$format>(
-                    clsid,
-                    iid,
-                    out_object,
-                    &REGISTERED_FORMAT,
-                )
-            }
-        }
-
-        #[unsafe(no_mangle)]
-        pub unsafe extern "system" fn GetNumberOfFormats(
-            num_formats: *mut u32,
-        ) -> $crate::windows_crate::core::HRESULT {
-            unsafe {
-                if num_formats.is_null() {
-                    return $crate::windows_crate::Win32::Foundation::E_INVALIDARG;
-                }
-                *num_formats = 1;
-                $crate::windows_crate::Win32::Foundation::S_OK
-            }
-        }
-
-        #[unsafe(no_mangle)]
-        pub unsafe extern "system" fn GetHandlerProperty2(
-            format_index: u32,
-            prop_id: u32,
-            value: *mut ::std::ffi::c_void,
-        ) -> $crate::windows_crate::core::HRESULT {
-            unsafe {
-                $crate::windows::exports::get_handler_property2::<$format>(
-                    format_index,
-                    prop_id,
-                    value,
-                )
-            }
-        }
+        $crate::register_format!(@impl $format, $crate::windows::handler::create_out_vtable::<$format>);
     };
 }
 
 /// Log a message to the debug file (if debug feature is enabled).
+/// Uses a macro to ensure format arguments are not evaluated in release builds.
 #[cfg(feature = "debug")]
-fn log_debug(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\temp\\7zip-plugin-debug.log")
-    {
-        let _ = writeln!(file, "{}", msg);
-    }
+macro_rules! log_debug {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\temp\\7zip-plugin-debug.log")
+        {
+            let _ = writeln!(file, $($arg)*);
+        }
+    }};
 }
 
 #[cfg(not(feature = "debug"))]
-fn log_debug(_msg: &str) {}
+macro_rules! log_debug {
+    ($($arg:tt)*) => {};
+}
+
+/// Convert 16-byte array to GUID at compile time.
+pub const fn guid_from_bytes(bytes: &[u8; 16]) -> GUID {
+    GUID {
+        data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        data2: u16::from_le_bytes([bytes[4], bytes[5]]),
+        data3: u16::from_le_bytes([bytes[6], bytes[7]]),
+        data4: [
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ],
+    }
+}
 
 /// Implementation of CreateObject for a registered format.
 ///
@@ -178,20 +145,21 @@ pub unsafe fn create_object<T: crate::ArchiveReader>(
     format: &'static super::handler::RegisteredFormat<T>,
 ) -> HRESULT {
     unsafe {
-        log_debug("CreateObject called");
+        log_debug!("CreateObject called");
 
         if clsid.is_null() || iid.is_null() || out_object.is_null() {
-            log_debug("CreateObject: null pointer");
+            log_debug!("CreateObject: null pointer");
             return E_INVALIDARG;
         }
 
         let clsid = &*clsid;
         let iid = &*iid;
 
-        // Check if the CLSID matches our format
+        // Check if the CLSID matches our format (computed at compile time per monomorphization)
+        const { assert!(std::mem::size_of::<GUID>() == 16) };
         let format_guid = guid_from_bytes(&T::class_id());
 
-        log_debug(&format!(
+        log_debug!(
             "CreateObject: clsid={{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
             clsid.data1,
             clsid.data2,
@@ -204,8 +172,8 @@ pub unsafe fn create_object<T: crate::ArchiveReader>(
             clsid.data4[5],
             clsid.data4[6],
             clsid.data4[7]
-        ));
-        log_debug(&format!(
+        );
+        log_debug!(
             "CreateObject: format_guid={{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
             format_guid.data1,
             format_guid.data2,
@@ -218,10 +186,10 @@ pub unsafe fn create_object<T: crate::ArchiveReader>(
             format_guid.data4[5],
             format_guid.data4[6],
             format_guid.data4[7]
-        ));
+        );
 
         if *clsid != format_guid {
-            log_debug("CreateObject: CLSID mismatch!");
+            log_debug!("CreateObject: CLSID mismatch!");
             *out_object = std::ptr::null_mut();
             return CLASS_E_CLASSNOTAVAILABLE;
         }
@@ -245,21 +213,6 @@ pub unsafe fn create_object<T: crate::ArchiveReader>(
         // Unknown interface
         *out_object = std::ptr::null_mut();
         CLASS_E_CLASSNOTAVAILABLE
-    }
-}
-
-/// Convert 16-byte array to GUID.
-///
-/// The byte array is interpreted as a raw memory copy of a GUID structure.
-/// GUID layout: Data1 (4 bytes LE) - Data2 (2 bytes LE) - Data3 (2 bytes LE) - Data4 (8 bytes)
-fn guid_from_bytes(bytes: &[u8; 16]) -> GUID {
-    GUID {
-        data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        data2: u16::from_le_bytes([bytes[4], bytes[5]]),
-        data3: u16::from_le_bytes([bytes[6], bytes[7]]),
-        data4: [
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ],
     }
 }
 

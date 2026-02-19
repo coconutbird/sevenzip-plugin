@@ -24,3 +24,6 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
 ] }
 windows-core = "0.62"
+
+[dev-dependencies]
+cargo-husky = { version = "1.5.0", features = ["precommit-hook", "user-hooks"] }
